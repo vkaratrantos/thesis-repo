@@ -1,0 +1,29 @@
+# MoveIt uses this to know which controller executes which group
+moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
+
+moveit_simple_controller_manager:
+  controller_names:
+    - arm_controller
+    - gripper_controller
+
+  arm_controller:
+    action_ns: follow_joint_trajectory
+    type: FollowJointTrajectory
+    default: true
+    joints:
+      - joint1
+      - joint2
+      - joint3
+      - joint4
+      - joint5
+      - joint6
+      - joint7
+
+  gripper_controller:
+  # ΑΛΛΑΓΗ: Το σωστό namespace για GripperActionController
+  action_ns: gripper_cmd
+  # ΑΛΛΑΓΗ: Ο σωστός τύπος εντολής
+  type: GripperCommand
+  default: true
+  joints:
+    - endeffector_gripper

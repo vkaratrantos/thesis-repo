@@ -1,0 +1,21 @@
+planning_plugin: stomp_moveit/StompPlanner
+request_adapters: >-
+  default_planner_request_adapters/ResolveConstraintFrames
+  default_planner_request_adapters/FixWorkspaceBounds
+  default_planner_request_adapters/FixStartStateBounds
+  default_planner_request_adapters/FixStartStateCollision
+  default_planner_request_adapters/FixStartStatePathConstraints    
+  stomp_moveit/StompSmoothingAdapter
+  default_planner_request_adapters/AddTimeOptimalParameterization
+
+planner_configs:
+  RRTConnectkConfigDefault:
+    type: geometric::RRTConnect
+    range: 0.0 
+
+arm_group:
+  planner_configs:
+    - RRTConnectkConfigDefault
+  enforce_constrained_state_space: true
+  projection_evaluator: joints(joint1,joint2) 
+  longest_valid_segment_fraction: 0.005

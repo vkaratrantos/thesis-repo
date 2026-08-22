@@ -1,0 +1,14 @@
+ompl_stomp:
+  stomp:
+    initialization_method: 3 
+    num_timesteps: 60           
+    num_iterations: 60          
+    num_iterations_after_valid: 0
+    num_rollouts: 15            
+    max_rollouts: 15
+    
+    # Keep this weight moderate to allow the arm to curve around obstacles
+    control_cost_weight: 0.5    
+    
+    validity_system:
+      name: stomp_moveit/CollisionCheck

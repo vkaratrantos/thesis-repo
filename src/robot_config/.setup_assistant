@@ -1,0 +1,25 @@
+moveit_setup_assistant_config:
+  urdf:
+    package: myarm_300_pi
+    relative_path: urdf/myarm_300_pi_thorgripper.urdf
+  srdf:
+    relative_path: config/myarm_300_pi_thorgripper.srdf
+  package_settings:
+    author_name: Vasileios Karatrantos
+    author_email: v.karatrantos@gmail.com
+    generated_timestamp: 1764432446
+  control_xacro:
+    command:
+      - position
+    state:
+      - position
+      - velocity
+  modified_urdf:
+    xacros:
+      - control_xacro
+  control_xacro:
+    command:
+      - position
+    state:
+      - position
+      - velocity
