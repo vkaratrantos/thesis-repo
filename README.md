@@ -15,22 +15,6 @@ return it). Planning is MoveIt 2 + MoveIt Task Constructor.
 | `src/myarm_motion_planning` | Motion-planning experiments |
 | `my_robot` | Hardware bridges, fake robot, and the Tkinter GUI |
 
-## Dependencies
-
-Built and tested on **Ubuntu 22.04 / ROS 2 Humble**.
-
-This workspace is an overlay on two things that are **not** in this repo:
-
-1. **MoveIt 2 built from source** in `~/ws_moveit2`.
-2. **MoveIt Task Constructor**, cloned into the workspace root:
-
-   ```bash
-   cd <workspace>
-   git clone https://github.com/moveit/moveit_task_constructor.git
-   ```
-
-   It is excluded via `.gitignore` because it is unmodified upstream source.
-
 ## Build
 
 ```bash
@@ -73,9 +57,3 @@ and replies `OK <cmd>` / `FAIL <cmd>` on `/gui_status`.
 
 Without a camera publishing `marker_N` frames, `simple_move` falls back to
 hardcoded tube positions; `TASK` requires the TF and will fail without it.
-
-## Known limitations
-
-- Launch files contain absolute `/home/vkaratrantos/...` paths.
-- `demo_gazebo.launch.py` does not register the `ompl` planning pipeline, so
-  planning from the RViz panel fails there (the GUI path is unaffected).
