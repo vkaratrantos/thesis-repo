@@ -15,25 +15,6 @@ return it). Planning is MoveIt 2 + MoveIt Task Constructor.
 | `src/myarm_motion_planning` | Motion-planning experiments |
 | `my_robot` | Hardware bridges, fake robot, and the Tkinter GUI |
 
-## Build
-
-```bash
-source /opt/ros/humble/setup.bash
-source ~/ws_moveit2/install/setup.bash
-colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
-```
-
-## Run (simulated robot, no hardware)
-
-```bash
-./start_lab.sh
-```
-
-Starts, in order: the fake robot, MoveIt + RViz, the `simple_move` command
-bridge, and the GUI. It kills any previous session first — a leftover
-`move_group` or a second `simple_move` will silently steal or duplicate
-trajectories.
-
 Modes are mutually exclusive — run exactly one:
 
 | Launch | Hardware interface | Physics |
