@@ -10,11 +10,8 @@ class FakeRobot(Node):
     def __init__(self):
         super().__init__('fake_robot_bridge')
         
-        # Στέλνουμε στο fake topic για να τα διαβάσει ο jsp_node του launch file
         self.js_pub = self.create_publisher(JointState, '/fake_joint_states', 10)
-        
         cb_group = ReentrantCallbackGroup()
-        
         self.arm_server = ActionServer(
             self, FollowJointTrajectory, '/arm_controller/follow_joint_trajectory', 
             self.execute_callback, callback_group=cb_group)
