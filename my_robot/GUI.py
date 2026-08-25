@@ -4,14 +4,11 @@ import datetime
 import threading
 import time
 import sys
-
-# --- ROS 2 LIBRARIES ---
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
 from std_msgs.msg import String
 
-# Configuration
 REAGENTS = {
     "Tube 1": "Copper Sulfate (CuSO4)",
     "Tube 2": "Sodium Hydroxide (NaOH)",
@@ -29,7 +26,6 @@ RECIPES = {
     "Neutralization": [4, 2]
 }
 
-# Colors
 COLOR_BG = "#0a0a0a"
 COLOR_PANEL = "#141414"
 COLOR_BLUE_NEON = "#0066cc"
@@ -44,21 +40,15 @@ class LabApp:
         self.root.title("Automated Chemical Synthesis")
         self.root.geometry("1200x850") 
         self.root.configure(bg=COLOR_BG)
-
         self.manual_batch = [] 
-        
-        # FIX: Safety locks and debouncers to prevent double-firing
         self.sequence_lock = threading.Lock()
         self.last_manual_cmd = ""
         self.last_manual_time = 0
 
-        # --- NATIVE ROS 2 INITIALIZATION ---
         rclpy.init(args=None)
         self.ros_node = rclpy.create_node('gui_commander_node')
         self.publisher = self.ros_node.create_publisher(String, '/gui_commands', 10)
 
-        # Outcome of each command, so a sequence can stop when a step fails.
-        # simple_move publishes "OK <cmd>" or "FAIL <cmd>" on /gui_status.
         self.status_lock = threading.Lock()
         self.status_event = threading.Event()
         self.pending_cmd = None
@@ -66,17 +56,12 @@ class LabApp:
         self.abort_requested = False
         self.ros_node.create_subscription(String, '/gui_status', self.status_cb, 10)
 
-        # The node has to be spun to RECEIVE anything. Publishing worked without
-        # this, which is why it was never needed before.
         self.executor = SingleThreadedExecutor()
         self.executor.add_node(self.ros_node)
         self.spin_thread = threading.Thread(target=self.executor.spin, daemon=True)
         self.spin_thread.start()
-
-        # Ensure ROS 2 shuts down cleanly when you close the window
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        # Header
         header_frame = tk.Frame(root, bg=COLOR_BG, pady=20)
         header_frame.pack(fill="x")
         
@@ -84,7 +69,6 @@ class LabApp:
         tk.Label(header_frame, text="AUTOMATED FLUID HANDLING SYSTEM", font=("Arial", 16), bg=COLOR_BG, fg=COLOR_TEXT_DIM).pack(pady=(0, 10))
         tk.Frame(root, bg=COLOR_BORDER, height=2).pack(fill="x", padx=40, pady=(0, 20))
 
-        # Tabs
         style = ttk.Style()
         style.theme_use('alt') 
         style.configure("TNotebook", background=COLOR_BG, borderwidth=0)
@@ -112,14 +96,10 @@ class LabApp:
     def on_close(self):
         """Safely shuts down the ROS 2 node when the GUI is closed."""
         self.log("Shutting down GUI Node...")
-        # Release any sequence blocked in send_and_wait, or the daemon thread
-        # sits on its timeout while the window is already gone.
         self.abort_requested = True
         self.status_event.set()
         try:
             self.executor.shutdown()
-            # Let spin() actually return before tearing the node down, or rclpy
-            # aborts with "terminate called without an active exception".
             self.spin_thread.join(timeout=2.0)
         except Exception:
             pass
@@ -135,15 +115,13 @@ class LabApp:
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         print(f"[{timestamp}] [GUI] {message}")
 
-    # --- THE MAGIC PIPELINE ---
     def send_command(self, cmd, manual=False):
         """Publishes the command instantly as a native ROS 2 node."""
         
-        # FIX: Mouse-Bounce Debouncer for Manual Clicks
         if manual:
             current_time = time.time()
             if cmd == self.last_manual_cmd and (current_time - self.last_manual_time) < 0.3:
-                return # Ignore accidental physical double-clicks within 0.3 seconds
+                return
             self.last_manual_cmd = cmd
             self.last_manual_time = current_time
 
@@ -158,8 +136,6 @@ class LabApp:
         ok = data.startswith("OK ")
         cmd = data.split(" ", 1)[1].strip() if " " in data else ""
         with self.status_lock:
-            # Ignore anything we are not currently waiting on -- a late reply to
-            # an aborted step must not release the next wait.
             if self.pending_cmd is None or cmd != self.pending_cmd:
                 return
             self.last_result = ok
@@ -212,7 +188,6 @@ class LabApp:
                 return False
         return True
 
-    # --- AUTO MODE ---
     def build_auto_tab(self):
         container = tk.Frame(self.tab_auto, bg=COLOR_PANEL)
         container.pack(expand=True, fill="both", pady=40)
@@ -246,12 +221,10 @@ class LabApp:
 
         threading.Thread(target=task, daemon=True).start()
 
-    # --- MANUAL MODE ---
     def build_manual_tab(self):
         main_frame = tk.Frame(self.tab_manual, bg=COLOR_PANEL)
         main_frame.pack(fill="both", expand=True, padx=40, pady=20)
 
-        # DIRECT OVERRIDE PANEL
         override_frame = tk.LabelFrame(main_frame, text=" DIRECT ROBOT OVERRIDE ", 
                                        bg=COLOR_PANEL, fg=COLOR_BLUE_NEON, font=("Arial", 14, "bold"), pady=15, padx=15)
         override_frame.pack(fill="x", pady=(0, 20))
@@ -259,7 +232,6 @@ class LabApp:
         actions_frame = tk.Frame(override_frame, bg=COLOR_PANEL)
         actions_frame.pack(pady=5)
 
-        # Note: Added 'manual=True' to engage the debouncer
         tk.Button(actions_frame, text="OPEN GRIPPER", bg="#333", fg="white", width=15, font=("Arial", 12, "bold"), 
                   command=lambda: self.send_command("o", manual=True)).grid(row=0, column=0, padx=10)
         tk.Button(actions_frame, text="CLOSE GRIPPER", bg="#333", fg="white", width=15, font=("Arial", 12, "bold"), 
@@ -276,7 +248,6 @@ class LabApp:
             tk.Button(targets_frame, text=f"GO TO TUBE {i}", bg="#222", fg="white", width=12, font=("Arial", 10), 
                       command=lambda m=i: self.send_command(f"m {m}", manual=True)).grid(row=0, column=i-1, padx=5)
 
-        # MANUAL BATCH
         batch_frame = tk.LabelFrame(main_frame, text=" MANUAL BATCH PROTOCOL ", 
                                     bg=COLOR_PANEL, fg=COLOR_TEXT_DIM, font=("Arial", 14, "bold"), pady=15, padx=15)
         batch_frame.pack(fill="both", expand=True)
@@ -315,7 +286,6 @@ class LabApp:
 
         self.log("Starting Manual Dispense Protocol...")
         
-        # Copy the list and clear the UI immediately
         batch_to_run = list(self.manual_batch)
         self.manual_batch.clear()
         self.batch_lbl.config(text="SEQUENCE: 0 ITEMS PENDING", fg=COLOR_TEXT_DIM)
