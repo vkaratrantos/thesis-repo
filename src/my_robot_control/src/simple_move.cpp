@@ -1,25 +1,6 @@
 // ============================================================================
 //  LIQUID HANDLING 7-DOF ROBOTIC ARM
-//  MoveIt 2 + MoveIt Task Constructor
-//
-//  Commands (published as std_msgs/String on /gui_commands):
-//    TASK <1-5>   full MTC pick-and-carry pipeline for that tube
-//    m<0-6>       manual hybrid move to a marker (OMPL transit + Cartesian descent)
-//    <x> <y> <z>  manual hybrid move to raw coordinates
-//    o            open gripper (detaches held tube)
-//    c            close gripper (attaches tube at current marker)
-//    p            pour
-//    h            return to home pose
-//    q            quit
 // ============================================================================
-
-// ---- BUILD NOTE ------------------------------------------------------------
-// Uncomment the following line if you are building against MoveIt 2 Jazzy or
-// newer, where computeCartesianPath() takes MaxEEFStep / JumpThreshold structs
-// instead of plain doubles.
-//
-// #define MOVEIT_JAZZY_OR_NEWER 1
-// ----------------------------------------------------------------------------
 
 #include <atomic>
 #include <chrono>
@@ -71,7 +52,6 @@
 #include <moveit/robot_trajectory/robot_trajectory.h>
 #include <moveit/trajectory_processing/time_optimal_trajectory_generation.h>
 
-// ---- MoveIt Task Constructor ----------------------------------------------
 #include <moveit/task_constructor/task.h>
 #include <moveit/task_constructor/solvers/cartesian_path.h>
 #include <moveit/task_constructor/solvers/joint_interpolation.h>
@@ -84,25 +64,8 @@
 namespace mtc = moveit::task_constructor;
 using MGI = moveit::planning_interface::MoveGroupInterface;
 
-// ============================================================================
 //  CONSTANTS
-//  Every magic number lives here. In the original file the tube height and the
-//  mixer radius were defined differently in setupCollisionObjects() and in the
-//  dynamic updater, so the scene silently changed shape 500 ms after startup.
-// ============================================================================
 
-// ---- Speed scaling ---------------------------------------------------------
-// These only started meaning anything once fake_robot.py was made to honour
-// time_from_start; before that every trajectory was replayed at a flat 20 ms
-// per waypoint and the scaling was inert.
-//
-// Nothing here is velocity-limited in practice -- with max_velocity 3.0 and
-// max_acceleration 3.0 from joint_limits.yaml, the moves are entirely
-// acceleration-limited, so ACC_SCALE is the knob that changes how long a move
-// takes. VEL_SCALE effectively does nothing at these values.
-//
-// The 2:1 ratio between transit and liquid is deliberate and worth keeping:
-// carrying a full tube should visibly be the gentler motion.
 static constexpr double VEL_SCALE_TRANSIT = 0.30;
 static constexpr double ACC_SCALE_TRANSIT = 0.30;
 static constexpr double VEL_SCALE_LIQUID  = 0.15;   // slower when carrying
@@ -116,26 +79,16 @@ static constexpr double TABLE_CENTER_Z  = -0.03;    // -> top surface at z = -0.
 // ---- Test tubes ------------------------------------------------------------
 static constexpr double TUBE_HEIGHT = 0.13;
 static constexpr double TUBE_RADIUS = 0.012;
-// NOTE: geometrically this should be table_top + height/2 = -0.01 + 0.065 = 0.055.
-// Your original code used 0.07 at init and 0.08 in the updater. 0.08 is kept
-// here to preserve the behaviour you tuned against, but verify it in RViz --
-// if it is wrong, the tube collision cylinder floats 2.5 cm above the table
-// and the gripper can clip the real tube without the planner noticing.
 static constexpr double TUBE_CENTER_Z = 0.06;
-
-// marker -> tube body, in y. Together with GRASP_Y_OFFSET below this implies a
-// 135 mm gap, which is correct: that gap is the distance from the flange (where
-// the TCP frame is) out to the fingertips. See TUBE_TCP_Y_OFFSET.
 static constexpr double TUBE_Y_OFFSET = 0.02;
 
-// ---- Mixer -----------------------------------------------------------------
+// ---- Mixing Vessel ---------------------------------------------------------
 static constexpr double MIXER_HEIGHT   = 0.17;
-static constexpr double MIXER_RADIUS   = 0.06;      // updater used 0.05; unified
-static constexpr double MIXER_CENTER_Z = 0.06;      // updater used 0.07; unified
+static constexpr double MIXER_RADIUS   = 0.06;  
+static constexpr double MIXER_CENTER_Z = 0.06;     
 static constexpr double MIXER_Y_OFFSET = 0.10;
 
 // ---- Grasp geometry --------------------------------------------------------
-// marker -> TCP, in y. This is the number the arm has actually been driven with.
 static constexpr double GRASP_Y_OFFSET = 0.155;
 static constexpr double GRASP_Z        = 0.1;      // TCP height at the tube
 static constexpr double POUR_Z         = 0.20;      // TCP height above the mixer
@@ -143,109 +96,41 @@ static constexpr double APPROACH_DIST  = 0.10;      // vertical descent to grasp
 static constexpr double LIFT_DIST      = 0.12;      // vertical retreat after grasp
 static constexpr double STANDOFF_TUBE  = 0.10;
 
-// How much rotation about the tool axis the interpolator may invent when a
-// strict straight line fails. A test tube is a cylinder, so spin about its long
-// axis does not change the grasp -- that freedom is yours to spend.
-// Set to 0.0 if your gripper fingers are asymmetric or a cable would wrap.
-// Rotation the interpolator may invent about the tool axis when a strict
-// straight line fails.
-//
-// DISABLED (0.0), and it should stay that way unless you change the gripper.
-// The tube axis is the TCP frame's X, but the grasp point is 135 mm OFF that
-// axis, so rotating about it does not spin the tube in place -- it swings the
-// tube around a 135 mm radius, up to 270 mm of lateral travel. During a descent
-// into the rack that would sweep the fingers right off the tube, or into its
-// neighbours. Free-axis relaxation is only safe when the grasp point lies ON
-// the axis of symmetry, which here it does not.
-//
-// (The orientation CONSTRAINT still frees X, and that is correct: rotating about
-// a vertical axis keeps the tube upright, so nothing spills. Constraint and
-// interpolator are asking different questions.)
+// (The orientation CONSTRAINT still frees X)
 static constexpr double TOOL_AXIS_FREEDOM = 0.0;
-
-// How close to a joint stop a standoff configuration may sit, in radians.
-//
-// Not a tuning knob so much as a feasibility floor. A configuration in bounds
-// but hard against a limit has no room to descend: measured on the real task,
-// the arm reached the standoff with joint5 at 2.962 against a 2.967 limit --
-// 0.005 rad of headroom -- and the descent stalled at 11% because continuing
-// required flipping joint5 by 2.80 rad to the mirror wrist branch. The working
-// configuration at the same pose sat at joint5 = 0.065, with 2.90 rad spare.
-//
-// The measured populations are far apart: every configuration that stalled a
-// descent had headroom below 0.01 rad (0.005, 7e-05, 5e-06, 1e-05), while every
-// working one measured 0.18 or more. 0.05 sits in the empty gap between them,
-// rejecting every observed failure by a factor of five while leaving the
-// marginal cases to the dry run -- which is the authoritative test and costs
-// only ~250 ms.
-//
-// This started at 0.15 and that was too aggressive: it threw away candidates
-// with 0.128-0.131 rad of headroom without ever testing them, which pushed the
-// search through all six generators (3.8 s of IK) and down to a lower standoff
-// height for no reason.
 static constexpr double LIMIT_HEADROOM_MIN = 0.05;
 
 // ---- Upright transits with an empty gripper --------------------------------
-// ON by default: the tool is now kept upright whether or not a tube is held.
-// There is nothing to spill with an empty gripper, but an unconstrained transit
-// tilts the tool up to 32.5 degrees and arrives in whatever configuration OMPL
-// liked, which is what the descent then has to live with.
-//
-// Kept as a runtime toggle ('u' on /gui_commands) rather than deleted, because
-// it is the A/B control for the descent-stall bug this fixes: flipping it back
-// restores the legacy joint-target transit without a rebuild.
+// ON by default
 static std::atomic<bool> g_upright_when_empty{true};
 
-// How far the tube may tip from vertical during a carrying move, in radians.
-// 0.10 rad is about 6 degrees. Tighter is safer for the liquid but much harder
-// for OMPL to plan -- see the note on enforce_constrained_state_space below.
+// How far the tube may tip from vertical during a carrying move, in rad
 static constexpr double TILT_TOLERANCE = 0.3;
 static constexpr double STANDOFF_MIXER = 0.12;
 
 // ---- Misc ------------------------------------------------------------------
 // ---- Where the carried tube sits relative to the TCP ----------------------
-// getEndEffectorLink() returns the FLANGE, not the fingertips. The gripper
-// reaches ~135 mm beyond it, so a tube held between the fingers sits that far
-// from the TCP frame origin. Setting these to zero puts the tube at the wrist,
-// which is exactly what it looks like in RViz when you get it wrong.
-//
-// This is also why TUBE_Y_OFFSET (0.02) and GRASP_Y_OFFSET (0.155) differ:
-//   marker -> tube      = 0.020
-//   marker -> flange    = 0.155
-//   flange -> fingertips= 0.135   <- the gripper's own length
-// so the fingers land at 0.155 - 0.135 = 0.020 = the tube. Consistent, not
-// contradictory. Verify by grabbing a tube and looking in RViz: the cylinder
-// must appear between the fingers.
-static constexpr double TUBE_TCP_Y_OFFSET = -0.135;  // -0.135
-static constexpr double TUBE_TCP_Z_OFFSET = -0.01;            // -0.030
 
-static constexpr double MIXER_TOP_Z = MIXER_CENTER_Z + MIXER_HEIGHT / 2.0;   // 0.165
+static constexpr double TUBE_TCP_Y_OFFSET = -0.135;
+static constexpr double TUBE_TCP_Z_OFFSET = -0.01;
+
+static constexpr double MIXER_TOP_Z = MIXER_CENTER_Z + MIXER_HEIGHT / 2.0;
 
 // ---- Pour pose: where the TCP goes, relative to marker_6 ------------------
-// Same pattern as GRASP_Y_OFFSET, which is the one that already works. The goal
-// is the tube held BESIDE the mixer and above its rim, so that tilting it with
-// the 'p' command sends the liquid into the opening -- not the tube lowered
-// into the mixer.
-//
-// Tune these by eye: send 'm6' and look at where the tube ends up in RViz.
-static constexpr double POUR_X_OFFSET = 0.00;   // TCP x = marker_x + this
-static constexpr double POUR_Y_OFFSET = 0.00;   // TCP y = marker_y + this
+
+static constexpr double POUR_X_OFFSET = 0.00;   // TCP x = marker_x + POUR_X_OFFSET
+static constexpr double POUR_Y_OFFSET = 0.00;   // TCP y = marker_y + POUR_Y_OFFSET
 
 // ---- Fallback positions, used only when TF has nothing -------------------
-// Expressed as where the tube BODY is; marker positions are derived, so the
-// collision objects and the manual move targets cannot drift apart.
+
 static constexpr int NUM_TUBES = 5;
-// TCP targets for manual moves. These are the values the arm has actually
-// reached, so they are the ones to trust.
 static const double  TUBE_FALLBACK_X[NUM_TUBES] = { -0.17, -0.10, 0.00, 0.10, 0.17 };
 static constexpr double TUBE_FALLBACK_Y  = -0.21;
 static constexpr double TUBE_FALLBACK_Z  = 0.08;
 static constexpr double MIXER_FALLBACK_MARKER_X = -0.20;
 static constexpr double MIXER_FALLBACK_MARKER_Y = -0.11;
 
-// Where to park the tube COLLISION OBJECTS when there is no TF. Separate from
-// the targets above on purpose -- these are a guess about the world, those are
-// a measured fact about the arm.
+// Where to park the tube COLLISION OBJECTS when there is no TF
 static const double  TUBE_OBJ_FALLBACK_X[NUM_TUBES] = { -0.17, -0.085, 0.0, 0.085, 0.17 };
 static constexpr double TUBE_OBJ_FALLBACK_Y = -0.335;
 static constexpr double MIXER_OBJ_FALLBACK_X = -0.32;
@@ -254,24 +139,19 @@ static constexpr double MIXER_OBJ_FALLBACK_Y = -0.33;
 static constexpr int MIXER_MARKER    = 6;
 static constexpr int STATE_SETTLE_MS = 500;
 
-// ============================================================================
 //  SHARED STATE
-// ============================================================================
 
 static std::queue<std::string> command_queue;
 static std::mutex              queue_mutex;
 
-// Which tube (if any) is currently on the gripper. The background updater skips
-// republishing this one, otherwise a world copy of the tube would fight the
-// attached copy.
+// Which tube is currently on the gripper
+
 static std::atomic<int> attached_marker_id{ -1 };
 
-// Hard pause for the background scene updater. MTC plans the whole pipeline
-// offline against a scene snapshot; if the updater keeps rewriting collision
-// objects mid-plan, MTC is planning against a moving target.
+// Hard pause for the background scene updater
+
 static std::atomic<bool> scene_updates_paused{ false };
 
-// RAII: pause scene updates for the lifetime of the guard.
 class ScenePause
 {
 public:
@@ -279,17 +159,8 @@ public:
     ~ScenePause() { scene_updates_paused.store(false); }
 };
 
-// ============================================================================
 //  SCENE HELPERS
-// ============================================================================
 
-// Look up a marker's XY position expressed in the planning frame.
-//
-// The original code looked up "marker_base" -> "marker_N" but then stamped the
-// resulting CollisionObject with getPlanningFrame(). That is only correct if
-// those two frames coincide. Asking TF for the transform directly into the
-// planning frame is always correct, and fails loudly if the frames are not
-// connected -- which is what you want.
 static bool lookupMarkerXY(tf2_ros::Buffer & tf_buffer,
                            const std::string & planning_frame,
                            int marker_id,
@@ -410,7 +281,7 @@ static void setupCollisionObjects(const std::string & frame_id, tf2_ros::Buffer 
         objects.push_back(makeTube(i, frame_id, mx, my));
     }
 
-    // ---- Mixer -------------------------------------------------------------
+    // ---- Mixing Vessel -----------------------------------------------------
     double mixer_x = MIXER_OBJ_FALLBACK_X, mixer_y = MIXER_OBJ_FALLBACK_Y;
     if (!lookupMarkerXY(tf_buffer, frame_id, MIXER_MARKER, mixer_x, mixer_y))
         std::cout << "    [-] TF for marker_6 not ready. Using fallback mixer pose.\n";
@@ -426,15 +297,8 @@ static void waitForStateSettle(MGI & iface, int ms = STATE_SETTLE_MS)
     iface.startStateMonitor(1.0);
 }
 
-// ---------------------------------------------------------------------------
-// Pour pose: TCP relative to marker_6, plus a printout of where that actually
-// puts the tube relative to the mixer body.
-//
-// The target itself is a plain offset you can tune. The printout is only a
-// sanity check -- it tells you how far the tube ends up from the mixer centre
-// and whether it clears the rim, so you can adjust POUR_*_OFFSET without
-// guessing. It cannot send the arm anywhere on its own.
-// ---------------------------------------------------------------------------
+// Pour pose
+
 static void mixerPourPose(double marker_x, double marker_y,
                           double & tcp_x, double & tcp_y, double & tcp_z)
 {
@@ -442,7 +306,6 @@ static void mixerPourPose(double marker_x, double marker_y,
     tcp_y = marker_y + POUR_Y_OFFSET;
     tcp_z = POUR_Z;
 
-    // Where the mixer body is, and where the tube will hang.
     const double body_x = marker_x;
     const double body_y = marker_y + MIXER_Y_OFFSET;
     const double tube_x = tcp_x + 0.0;
@@ -466,29 +329,10 @@ static void mixerPourPose(double marker_x, double marker_y,
     std::cout << "\n";
 }
 
-// ============================================================================
-//  MOTION HELPERS (manual / non-MTC path)
-//
-//  Contains a hand-written Cartesian interpolator. The short version of what
-//  that is: your controller only accepts joint angles, but you want the tool
-//  tip to travel in a straight line. There is no closed-form answer, so the
-//  line gets chopped into small steps and IK is solved at each one.
-//
-//  MoveIt's computeCartesianPath() does the same thing but STOPS at the first
-//  step where IK fails -- that is where the "90.4762%" came from. This version
-//  retries with different seeds, tries small rotations about the tool axis,
-//  and halves the step size before giving up.
-// ============================================================================
-
-// ---------------------------------------------------------------------------
+//  MOTION HELPERS
+// Cartesian interpolator
 // Collision-aware IK.
-//
-// setFromIK() checks kinematics and joint limits but NOT collisions. Handing
-// OMPL a single joint goal that happens to be in collision produces:
-//     "Unable to sample any valid states for goal tree"
-// because no valid state satisfies the goal. This wrapper gives setFromIK a
-// validity callback so it only ever returns collision-free solutions.
-// ---------------------------------------------------------------------------
+
 class IkValidator
 {
 public:
@@ -522,9 +366,6 @@ public:
         };
     }
 
-    // The manifold planner needs a snapshot of the live scene, including
-    // anything attached to the gripper. IkValidator already owns the monitor,
-    // so hand it out rather than starting a second one.
     const planning_scene_monitor::PlanningSceneMonitorPtr & psm() const { return psm_; }
 
     bool isStateValid(const moveit::core::RobotState & state, const std::string & group)
@@ -534,16 +375,8 @@ public:
         return !scene->isStateColliding(state, group);
     }
 
-    // -----------------------------------------------------------------------
-    // Say WHICH bodies are touching, rather than just that something is.
-    //
-    // isStateColliding() answers a yes/no question, and setFromIK() swallows
-    // even that -- a waypoint that fails the validity callback is
-    // indistinguishable from one with no IK solution at all. This runs the
-    // check again with contacts enabled so the actual pairs can be printed.
-    //
-    // Returns an empty vector when the state is collision-free.
-    // -----------------------------------------------------------------------
+    // WHICH bodies are touching, rather than just that something is.
+
     std::vector<std::string> contactPairs(const moveit::core::RobotState & state,
                                           const std::string & group,
                                           std::size_t max_contacts = 20)
@@ -578,15 +411,7 @@ public:
         return out;
     }
 
-    // -----------------------------------------------------------------------
-    // Allow (or forbid) contact between an object and a set of links.
-    //
-    // Needed because the tube collision cylinder now sits exactly where the
-    // gripper grasps it -- which is correct, but means every grasp pose reads
-    // as a collision until the fingers are told they may touch that one tube.
-    // This is the MoveGroupInterface equivalent of the ModifyPlanningScene
-    // allowCollisions() stage in the MTC pipeline.
-    // -----------------------------------------------------------------------
+    // Allow contact between an object and a set of links.
     void allowCollisions(const std::string & object,
                          const std::vector<std::string> & links,
                          bool allow)
@@ -602,7 +427,6 @@ public:
         diff.is_diff = true;
         scene_pub_->publish(diff);
 
-        // Give the monitor a moment to apply the diff before anything plans.
         rclcpp::sleep_for(std::chrono::milliseconds(150));
         psm_->requestPlanningSceneState("/get_planning_scene");
 
@@ -616,14 +440,8 @@ private:
     planning_scene_monitor::PlanningSceneMonitorPtr psm_;
 };
 
-// ---------------------------------------------------------------------------
 // Find a collision-free IK solution close to a seed configuration.
-//
-// On a 7-DOF arm a pose goal is a goal *region* -- OMPL samples IK solutions
-// from it, so consecutive plans can land in wildly different arm postures and
-// the arm appears to loop around itself. Pinning one nearby solution fixes
-// that, provided the solution is collision-free (hence the validator).
-// ---------------------------------------------------------------------------
+
 static bool solveNearestIk(MGI & mg,
                            IkValidator & validator,
                            const geometry_msgs::msg::Pose & pose,
@@ -631,20 +449,6 @@ static bool solveNearestIk(MGI & mg,
                            moveit::core::RobotState & out_state,
                            int tries = 15,
                            double seed_spread = 0.8,
-                           // DO NOT lower this. 0.02 was tried and reverted.
-                           //
-                           // The argument for lowering it was that the timeout is
-                           // only paid in full on failures, so cutting it should
-                           // cost nothing real. Measured, it cut IK time 2.5x
-                           // (grasp IK 757 -> 307 ms) and broke markers 1 and 5
-                           // outright: both aborted at "NO kinematic solution at
-                           // the target at all", having succeeded moments earlier
-                           // with 0.41 and 0.89 rad of headroom.
-                           //
-                           // Some grasp poses simply need more than 20 ms of
-                           // TRAC-IK restarts, and re-seeding does not help --
-                           // every seed needs the longer budget. Failure here
-                           // aborts the whole command, so the 450 ms is insurance.
                            double ik_timeout = 0.05)
 {
     const auto * jmg = seed_state.getJointModelGroup(mg.getName());
@@ -670,8 +474,6 @@ static bool solveNearestIk(MGI & mg,
         std::vector<double> q;
         s.copyJointGroupPositions(jmg, q);
 
-        // Weight proximal joints more: the same angle at the base sweeps far
-        // more volume than at the wrist.
         double cost = 0.0;
         for (size_t k = 0; k < q.size(); ++k)
         {
@@ -685,22 +487,8 @@ static bool solveNearestIk(MGI & mg,
     return found;
 }
 
-// ---------------------------------------------------------------------------
-// Cheap kinematic reachability test: does ANY IK solution exist at this pose,
-// collisions aside?
-//
-// Worth having because FAILURE is what costs. solveNearestIk burns its whole
-// tries * ik_timeout budget whenever no solution exists, and the standoff
-// ladder runs six generators, so proving one height unreachable cost 3825 ms
-// -- measured on the mixer, whose full standoff height is genuinely out of
-// reach and therefore paid that price on every single approach, to learn
-// something the first sweep already knew.
-//
-// Deliberately ignores collisions. The question here is only "can the arm get
-// its tool there at all", which is what licenses skipping a whole height. A
-// pose that is reachable but blocked still goes through the full ladder, which
-// is right: that is the case where different seeds genuinely matter.
-// ---------------------------------------------------------------------------
+// kinematic reachability test
+
 static bool poseIsReachable(MGI & mg,
                             const geometry_msgs::msg::Pose & pose,
                             const moveit::core::RobotState & seed_a,
@@ -709,7 +497,7 @@ static bool poseIsReachable(MGI & mg,
                             double ik_timeout = 0.02)
 {
     const auto * jmg = seed_a.getJointModelGroup(mg.getName());
-    if (!jmg) return true;            // cannot tell -- never block on ignorance
+    if (!jmg) return true;
     const std::string tip = mg.getEndEffectorLink();
 
     for (int i = 0; i < tries; ++i)
@@ -737,13 +525,8 @@ static bool setNearestJointGoal(MGI & mg,
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Time-parameterise a raw trajectory and execute it. Cartesian paths come back
-// with no velocities or timing, so this step is mandatory for them.
-//
-// Kept because it is useful if you ever want to execute a hand-built
-// trajectory. [[maybe_unused]] silences the warning while nothing calls it.
-// ---------------------------------------------------------------------------
+// Time-parameterisation and execution of a raw trajectory
+
 [[maybe_unused]] static bool retimeAndExecute(MGI & mg,
                              moveit_msgs::msg::RobotTrajectory & traj_msg,
                              double vel_scale,
@@ -766,9 +549,7 @@ static bool setNearestJointGoal(MGI & mg,
     return mg.execute(traj_msg) == moveit::core::MoveItErrorCode::SUCCESS;
 }
 
-// ============================================================================
-//  THE INTERPOLATOR
-// ============================================================================
+//  INTERPOLATOR
 
 struct CartesianOptions
 {
@@ -779,19 +560,8 @@ struct CartesianOptions
     double ik_timeout         = 0.02;
 
     // ---- Free-axis relaxation ---------------------------------------------
-    // A test tube is a cylinder: rotating the gripper about the tube's long
-    // axis does not change the grasp. MoveIt's version demands a fully
-    // specified 6-DOF pose at every waypoint and throws that freedom away.
-    // Letting each waypoint pick its own rotation about free_axis turns a
-    // 6-DOF-constrained problem into a 5-DOF one, which massively enlarges
-    // the set of reachable paths.
-    //
-    // Set to 0.0 when the exact orientation genuinely matters.
-    double          free_axis_tolerance = 0.0;               // rad, e.g. M_PI
-    // TCP local X, NOT Z. Under q_upright = setRPY(0, -pi/2, pi/2) the TCP's X
-    // axis points straight up, so X is the tube's long axis and the harmless
-    // one to spin about. Z points horizontally -- freeing it tips the tube.
-    Eigen::Vector3d free_axis           = Eigen::Vector3d::UnitX();  // in TCP frame
+    double          free_axis_tolerance = 0.0;               
+    Eigen::Vector3d free_axis           = Eigen::Vector3d::UnitX();  
     int             free_axis_samples   = 9;
 };
 
@@ -831,10 +601,8 @@ static double maxJointDelta(const moveit::core::RobotState & a,
     return worst;
 }
 
-// ---------------------------------------------------------------------------
-// Solve a single waypoint. This is where all the retry logic lives -- the part
-// MoveIt's built-in version does not have.
-// ---------------------------------------------------------------------------
+// Solve a single waypoint
+
 static bool solveWaypoint(const moveit::core::JointModelGroup * jmg,
                           const std::string & tip,
                           IkValidator & validator,
@@ -851,10 +619,6 @@ static bool solveWaypoint(const moveit::core::JointModelGroup * jmg,
         moveit::core::RobotState s(seed);
         if (!s.setFromIK(jmg, pose, tip, opts.ik_timeout, validity)) return false;
         if (!s.satisfiesBounds(jmg)) return false;
-        // Local continuity check: reject a solution that jumped to a different
-        // part of the null space. This is the explicit version of MoveIt's
-        // "jump threshold", but measured against the previous waypoint rather
-        // than the average over the whole path.
         if (maxJointDelta(prev, s, jmg) > opts.max_joint_step) return false;
         out = s;
         return true;
@@ -863,8 +627,7 @@ static bool solveWaypoint(const moveit::core::JointModelGroup * jmg,
     // 1. Exact pose, seeded from the previous solution.
     if (attempt(goal_pose, prev)) return true;
 
-    // 2. Rotations about the free axis, walking outwards from zero so the
-    //    smallest deviation from the commanded orientation wins.
+    // 2. Rotations about the free axis
     if (opts.free_axis_tolerance > 1e-6 && opts.free_axis_samples > 1)
     {
         const int half = std::max(1, opts.free_axis_samples / 2);
@@ -893,23 +656,14 @@ static bool solveWaypoint(const moveit::core::JointModelGroup * jmg,
     return false;
 }
 
-// ---------------------------------------------------------------------------
 // Explain a waypoint that solveWaypoint() could not solve.
 //
-// solveWaypoint() returns a bare false, but there are THREE different ways to
-// get there and they call for opposite fixes:
-//
-//   (a) no IK solution exists at that pose at all       -> kinematic / reach
-//   (b) solutions exist but every one is in collision   -> something's in the way
+//   (a) no IK solution exists at that pose at all
+//   (b) solutions exist but every one is in collision
 //   (c) solutions exist and are collision-free, but sit further than
-//       max_joint_step from the previous waypoint       -> null-space jump,
-//       a continuity rejection, NOT an obstacle
-//
-// (c) is invisible to any amount of collision debugging, and on a 7-DOF arm
-// descending through a wrist singularity it is the likeliest of the three.
-// So: re-solve IK with the collision check OFF, then grade each solution
-// against the three gates separately and print the tally.
-// ---------------------------------------------------------------------------
+//       max_joint_step from the previous waypoint
+//       continuity rejection, NOT an obstacle
+
 static void diagnoseBlockedWaypoint(const moveit::core::JointModelGroup * jmg,
                                     const std::string & tip,
                                     IkValidator & validator,
@@ -930,12 +684,8 @@ static void diagnoseBlockedWaypoint(const moveit::core::JointModelGroup * jmg,
     std::cout << "    Target pose of the blocked waypoint: ("
               << p.x() << ", " << p.y() << ", " << p.z() << ")\n";
 
-    // ---- Re-solve with NO validity callback --------------------------------
-    // Same seeds solveWaypoint() would have used, minus the collision gate.
-    // Two seed radii, tracked separately: 0.25 is exactly what solveWaypoint()
-    // uses, 0.8 is wider. If the usable solutions only ever turn up under the
-    // wide radius, the fix is solveWaypoint's seed spread; if they turn up
-    // under the narrow one too, the fix is its attempt count / timeout.
+    // ---- Re-solve with NO validity callback ------------------------------
+
     std::vector<moveit::core::RobotState> raw;
     std::vector<double> raw_radius;
     const int probes = 40;
@@ -962,12 +712,13 @@ static void diagnoseBlockedWaypoint(const moveit::core::JointModelGroup * jmg,
         return;
     }
 
-    // ---- Grade every raw solution against the three gates -------------------
+    // ---- Grade every raw solution against the three gates ------------------
+
     int n_out_of_bounds = 0, n_colliding = 0, n_too_far = 0, n_would_pass = 0;
     double best_delta = std::numeric_limits<double>::infinity();
     std::string best_delta_joint = "?";
     std::vector<std::string> first_contacts;
-    std::vector<double> best_q;   // joint values of the closest collision-free solution
+    std::vector<double> best_q;
 
     int n_pass_narrow = 0, n_pass_wide = 0;
 
@@ -985,7 +736,6 @@ static void diagnoseBlockedWaypoint(const moveit::core::JointModelGroup * jmg,
             continue;
         }
 
-        // Collision-free and in bounds: the only remaining gate is continuity.
         std::vector<double> qa, qb;
         prev.copyJointGroupPositions(jmg, qa);
         s.copyJointGroupPositions(jmg, qb);
@@ -1037,9 +787,7 @@ static void diagnoseBlockedWaypoint(const moveit::core::JointModelGroup * jmg,
         std::cout << "        closest collision-free solution: " << best_delta
                   << " rad on '" << best_delta_joint << "'\n";
 
-        // Side-by-side joint values with their limits. A ~pi gap on a single
-        // wrist joint is a branch flip; a joint pinned at its limit is a range
-        // problem. The two look identical in the summary above.
+        // Side-by-side joint values with their limits
         std::vector<double> q_prev;
         prev.copyJointGroupPositions(jmg, q_prev);
         std::cout << "\n        joint      last good (t=" << (t_blocked - dt_smallest)
@@ -1062,9 +810,7 @@ static void diagnoseBlockedWaypoint(const moveit::core::JointModelGroup * jmg,
         }
     }
 
-    // The verdict. n_would_pass is what separates the two remaining stories,
-    // so it decides which one gets printed -- n_too_far > 0 on its own means
-    // nothing when some solutions passed anyway.
+    // The verdict
     if (n_would_pass == 0 && n_too_far > 0)
     {
         std::cout << "\n    (c) CONTINUITY REJECTION, not a collision. EVERY reachable,\n"
@@ -1094,16 +840,9 @@ static void diagnoseBlockedWaypoint(const moveit::core::JointModelGroup * jmg,
     std::cout << "    ==========================================================\n\n";
 }
 
-// ---------------------------------------------------------------------------
 // The interpolator itself. Returns the fraction of the line achieved and fills
-// `out` with whatever it managed to build.
-//
-// `start_state` defaults to wherever the arm is now. Passing one explicitly
-// lets a descent be planned from a configuration the arm has NOT moved to yet,
-// which is what makes it possible to check a standoff configuration before
-// committing the transit to it. `verbose` is off for those dry runs so the
-// diagnostics only fire on real moves.
-// ---------------------------------------------------------------------------
+// out with whatever it managed to build.
+
 static double planRobustCartesian(MGI & mg,
                                   IkValidator & validator,
                                   const geometry_msgs::msg::Pose & target,
@@ -1162,14 +901,11 @@ static double planRobustCartesian(MGI & mg,
             }
 
             dt_last = dt;
-            dt *= 0.5;   // adaptive refinement: try a smaller move
+            dt *= 0.5;
         }
 
         if (!advanced)
         {
-            // Genuinely stuck. Say why, at the smallest step that was tried --
-            // that is the waypoint closest to the previous one, so it is the
-            // most informative version of the blockage.
             if (verbose)
             {
                 const double t_blocked = std::min(1.0, t_done + dt_last);
@@ -1188,20 +924,8 @@ static double planRobustCartesian(MGI & mg,
     return t_done;
 }
 
-// ---------------------------------------------------------------------------
 // Reports the outcome of every command back to whoever sent it.
-//
-// /gui_commands was fire-and-forget: the GUI had no way of knowing whether a
-// command worked, so a batch would carry happily on to the next tube after a
-// failed grasp. This publishes "OK <cmd>" or "FAIL <cmd>" on /gui_status
-// exactly once per command.
-//
-// The report goes out from a DESTRUCTOR on purpose. The command loop leaves
-// through a dozen different `continue` statements, and anything that had to be
-// remembered at each exit would eventually miss one -- leaving a sequence
-// waiting for a reply that never comes. Defaulting to FAIL and requiring a
-// branch to say otherwise fails safe.
-// ---------------------------------------------------------------------------
+
 struct CommandReport
 {
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub;
@@ -1218,10 +942,8 @@ struct CommandReport
     }
 };
 
-// Elapsed-time helper for the approach stage breakdown. The manifold planner
-// reports its own planning time, but that is a small fraction of the delay
-// between a command and the arm moving -- the rest is IK and descent
-// verification, which was invisible until this existed.
+// Elapsed-time helper for the approach stage breakdown
+
 struct Stopwatch
 {
     std::chrono::steady_clock::time_point t0{ std::chrono::steady_clock::now() };
@@ -1238,16 +960,8 @@ struct Stopwatch
     }
 };
 
-// ---------------------------------------------------------------------------
 // Smallest distance from any active joint to its own nearest limit.
-//
-// This is the cheap version of "can this configuration still move". A wrist
-// joint sitting 0.005 rad from its stop looks perfectly healthy to a collision
-// check and to satisfiesBounds() -- it IS in bounds -- but a descent starting
-// there has nowhere to go, and the interpolator has to jump to the mirror wrist
-// branch ~2.8 rad away, which the continuity check then rejects. That is
-// exactly how a transit that "succeeded" produced a descent stuck at 11%.
-// ---------------------------------------------------------------------------
+
 static double minLimitHeadroom(const moveit::core::RobotState & state,
                                const moveit::core::JointModelGroup * jmg,
                                std::string * worst_joint = nullptr)
@@ -1275,17 +989,8 @@ static double minLimitHeadroom(const moveit::core::RobotState & state,
     return (worst == std::numeric_limits<double>::max()) ? 0.0 : worst;
 }
 
-// ---------------------------------------------------------------------------
 // The same wrist orientation, expressed on the other ZYZ branch.
-//
-// A spherical wrist reaches every orientation two ways: (q5, q6, q7) and
-// (q5 +/- pi, -q6, q7 +/- pi). IK seeded from a configuration on one branch
-// returns solutions on that branch, so when the arm's current posture has
-// joint5 jammed against its stop, every candidate derived from it is jammed
-// too -- measured, all four seeds came back within 1e-6 to 0.09 rad of the
-// limit while a perfectly good configuration existed on the other branch with
-// 0.23 rad to spare. Seeding from the mirror is what makes it findable.
-// ---------------------------------------------------------------------------
+
 static moveit::core::RobotState mirrorWristSeed(const moveit::core::RobotState & s,
                                                 const moveit::core::JointModelGroup * jmg)
 {
@@ -1294,8 +999,6 @@ static moveit::core::RobotState mirrorWristSeed(const moveit::core::RobotState &
     out.copyJointGroupPositions(jmg, q);
     if (q.size() >= 7)
     {
-        // Step towards the middle of the range, not blindly by +pi, so the
-        // mirror of a joint at its upper stop is not pushed past the lower one.
         q[4] += (q[4] > 0.0) ? -M_PI : M_PI;
         q[5]  = -q[5];
         q[6] += (q[6] > 0.0) ? -M_PI : M_PI;
@@ -1306,15 +1009,6 @@ static moveit::core::RobotState mirrorWristSeed(const moveit::core::RobotState &
     return out;
 }
 
-// ---------------------------------------------------------------------------
-// Would a straight-line descent from `from` down to `target` actually complete?
-//
-// Answered by running the real interpolator, with the real options, against the
-// real scene -- but from a hypothetical start state, without moving anything.
-// This is the whole point of the fix: descent feasibility becomes a property
-// the standoff configuration is SELECTED for, rather than something discovered
-// after the arm has already driven there and can no longer choose.
-// ---------------------------------------------------------------------------
 static double descentDryRun(MGI & mg,
                             IkValidator & validator,
                             const moveit::core::RobotState & from,
@@ -1337,19 +1031,9 @@ static double descentDryRun(MGI & mg,
     return f;
 }
 
-// ---------------------------------------------------------------------------
 // Pure joint-space interpolation between the current state and a target joint
-// configuration. Calls IK exactly ONCE (at the endpoint) instead of once per
-// waypoint, so it either works or fails cleanly -- never a mysterious 90%.
-//
-// The cost is that the tip bows slightly off the true straight line, so the
-// deviation is measured and the move is refused if it exceeds max_deviation.
-// Over a 10 cm approach expect 1-3 mm.
-// ---------------------------------------------------------------------------
-// `tilt_reference` / `max_tilt`, when supplied, refuse a path that leans the
-// tool too far on the way. A joint interpolation between two configurations at
-// the SAME pose is a null-space reconfiguration: the endpoints are both upright,
-// but nothing constrains the middle, and a carried tube would spill.
+// configuration. Calls IK exactly ONCE instead of once per waypoint, so it either works or fails
+
 static bool moveJointInterpolated(MGI & mg,
                                   IkValidator & validator,
                                   const moveit::core::RobotState & goal_state,
@@ -1371,8 +1055,6 @@ static bool moveJointInterpolated(MGI & mg,
     const Eigen::Vector3d line    = p_end - p_start;
     const double line_len = line.norm();
 
-    // Same tool axis convention as maxTiltAlongTrajectory(): TCP local X is the
-    // tube's long axis.
     Eigen::Vector3d ref_axis = Eigen::Vector3d::UnitZ();
     if (tilt_reference)
     {
@@ -1444,12 +1126,11 @@ static bool moveJointInterpolated(MGI & mg,
     return mg.execute(msg) == moveit::core::MoveItErrorCode::SUCCESS;
 }
 
-// ---------------------------------------------------------------------------
 // Straight-line move with a three-rung fallback ladder:
 //   1. interpolator, exact orientation
 //   2. interpolator, allowing rotation about the tool axis
 //   3. joint interpolation between IK-verified endpoints
-// ---------------------------------------------------------------------------
+
 static bool moveLinear(MGI & mg,
                        IkValidator & validator,
                        const geometry_msgs::msg::Pose & target,
@@ -1504,9 +1185,8 @@ static bool moveLinear(MGI & mg,
     return moveJointInterpolated(mg, validator, goal, vel_scale, acc_scale);
 }
 
-// ---------------------------------------------------------------------------
 // Free-space move with obstacle avoidance, via a validated joint goal.
-// ---------------------------------------------------------------------------
+
 static bool moveFreeSpace(MGI & mg,
                           IkValidator & validator,
                           const geometry_msgs::msg::Pose & target,
@@ -1528,8 +1208,6 @@ static bool moveFreeSpace(MGI & mg,
     if (mg.plan(plan) != moveit::core::MoveItErrorCode::SUCCESS)
         return false;
 
-    // The OMPL pipeline already applies time-optimal parameterisation with the
-    // scaling factors set above, so no manual retiming is needed here.
     return mg.execute(plan) == moveit::core::MoveItErrorCode::SUCCESS;
 }
 
@@ -1548,10 +1226,6 @@ static moveit_msgs::msg::Constraints uprightConstraint(
     ocm.absolute_z_axis_tolerance = tilt_tolerance;   // tipping -- keep tight
     ocm.weight                    = 1.0;
 
-    // ROTATION_VECTOR handles "one axis completely free" far better than the
-    // default XYZ Euler decomposition, which goes singular when one tolerance
-    // is pi. If this field does not exist on your moveit_msgs version, delete
-    // this line -- everything else still works.
     ocm.parameterization = moveit_msgs::msg::OrientationConstraint::ROTATION_VECTOR;
 
     moveit_msgs::msg::Constraints c;
@@ -1559,26 +1233,8 @@ static moveit_msgs::msg::Constraints uprightConstraint(
     return c;
 }
 
-// ---------------------------------------------------------------------------
 // Orientation path constraint for carrying a tube.
-//
-// AXIS CONVENTION: the free axis is X, matching CartesianOptions::free_axis.
-// Rotation about the tube's long axis does not spill anything, so it is left
-// free; tipping (X and Y) is what must stay tight. The previous version had X
-// free and Y/Z at 0.25 rad, which is the opposite convention and would have
-// permitted a 14-degree tip while forbidding harmless roll.
-//
-// NOTE ON PLANNING SPEED: by default OMPL enforces path constraints by
-// rejection sampling -- it samples states and discards ones that violate the
-// constraint. At a 6-degree tolerance almost every sample is discarded and
-// planning becomes very slow or fails. If you need tolerances this tight, set
-//     enforce_constrained_state_space: true
-// for arm_group in ompl_planning.yaml, which switches OMPL to a projection-based
-// constrained state space instead. Without that, loosen TILT_TOLERANCE to ~0.25.
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// Accessor for the trajectory inside a Plan (the field was renamed after Humble).
-// ---------------------------------------------------------------------------
+
 static const moveit_msgs::msg::RobotTrajectory & planTraj(const MGI::Plan & p)
 {
 #ifdef MOVEIT_JAZZY_OR_NEWER
@@ -1588,15 +1244,8 @@ static const moveit_msgs::msg::RobotTrajectory & planTraj(const MGI::Plan & p)
 #endif
 }
 
-// ---------------------------------------------------------------------------
-// Worst tilt of the tool axis away from its reference direction, over a whole
-// trajectory, in radians.
-//
-// This measures exactly the thing you care about -- how far the tube leans from
-// vertical -- and it is roll-invariant, so spin about the tube axis costs
-// nothing. That makes it a much better test than Euler-angle tolerances, which
-// go singular precisely when one axis is free.
-// ---------------------------------------------------------------------------
+// Worst tilt of the tool axis away from its reference direction
+
 static double maxTiltAlongTrajectory(MGI & mg,
                                      const moveit_msgs::msg::RobotTrajectory & traj_msg,
                                      const geometry_msgs::msg::Quaternion & reference,
@@ -1624,19 +1273,12 @@ static double maxTiltAlongTrajectory(MGI & mg,
     return worst;
 }
 
-// ---------------------------------------------------------------------------
 // Free-space move that keeps the tool upright, with a three-rung ladder.
-//
 //   1. OMPL with the tight constraint
 //   2. OMPL with a loosened constraint
 //   3. OMPL with NO constraint, then verify the resulting trajectory and reject
 //      it if the tube would ever tip past hard_limit
-//
-// Rung 3 is the important one. Constrained sampling is expensive because OMPL
-// throws away most of what it generates; planning freely and then checking the
-// answer costs almost nothing, and an unconstrained plan is often perfectly
-// upright anyway. This is what fixes "it will not let me carry the tube back".
-// ---------------------------------------------------------------------------
+
 static bool moveFreeSpaceUpright(MGI & mg,
                                  IkValidator & validator,
                                  const geometry_msgs::msg::Pose & target,
@@ -1672,8 +1314,6 @@ static bool moveFreeSpaceUpright(MGI & mg,
             return false;
         }
 
-        // Verify the tilt regardless of which rung produced the plan -- a
-        // constraint that OMPL believes it satisfied is still worth checking.
         const double tilt = maxTiltAlongTrajectory(mg, planTraj(plan), target.orientation);
         std::cout << "    [" << label << "] ok, max tilt "
                   << (tilt * 180.0 / M_PI) << " deg\n";
@@ -1701,27 +1341,8 @@ static bool moveFreeSpaceUpright(MGI & mg,
     return ok;
 }
 
-// ===========================================================================
-//  TRANSIT VIA THE 5-DOF UPRIGHT MANIFOLD
-// ===========================================================================
-//
-// Drop-in alternative to moveFreeSpaceUpright(). Same signature, same
-// semantics, same target pose -- it just gets there a different way.
-//
-// Instead of asking OMPL to respect an orientation constraint in the full
-// 7-DOF joint space, it searches the 5-DOF manifold on which the constraint is
-// already satisfied: joints 1-4 plus the roll about the vertical. Every sample
-// determines the whole arm through the closed-form ZYZ wrist inversion, so
-// collision checking sees the real gripper and the real tube, and the tube is
-// exactly upright at every waypoint rather than upright to within a tolerance.
-//
-// Measured on this robot's own transit set: 100% success at ~31 ms and 0.000
-// rad of tilt, against 60% at ~10 s and up to 0.418 rad for the constrained
-// 7-DOF path below.
-//
-// Returns false rather than throwing on any problem, so the caller can fall
-// back to moveFreeSpaceUpright().
-// ---------------------------------------------------------------------------
+// 5-DOF UPRIGHT MANIFOLD
+
 static std::unique_ptr<my_robot_control::ManifoldPlanner> g_manifold;
 
 static bool moveFreeSpaceManifold(MGI & mg,
@@ -1737,7 +1358,6 @@ static bool moveFreeSpaceManifold(MGI & mg,
     if (!g_manifold)
         return false;
 
-    // ---- where the arm is now ------------------------------------------
     const auto current = mg.getCurrentState(2.0);
     if (!current)
     {
@@ -1749,9 +1369,6 @@ static bool moveFreeSpaceManifold(MGI & mg,
     for (int k = 0; k < 7; ++k)
         start[k] = current->getVariablePosition("joint" + std::to_string(k + 1));
 
-    // ---- the goal roll --------------------------------------------------
-    // The caller's orientation is not decoration: the tube hangs 201 mm off
-    // the TCP, so the roll decides where the tube ends up. Pin it.
     const Eigen::Quaterniond q_goal(target.orientation.w, target.orientation.x,
                                     target.orientation.y, target.orientation.z);
     double roll = 0.0;
@@ -1762,7 +1379,6 @@ static bool moveFreeSpaceManifold(MGI & mg,
         return false;
     }
 
-    // ---- scene snapshot, with whatever is attached ----------------------
     planning_scene::PlanningScenePtr scene;
     {
         planning_scene_monitor::LockedPlanningSceneRO ro(validator.psm());
@@ -1775,11 +1391,6 @@ static bool moveFreeSpaceManifold(MGI & mg,
     }
     g_manifold->setScene(scene, scene->getCurrentState());
 
-    // A pose has many configurations. When the caller has already worked out
-    // WHICH one it wants -- as approachTarget does, deriving the standoff
-    // configuration from the grasp configuration so the descent afterwards is a
-    // short joint move -- honour it. Arriving at the right pose in a flipped
-    // elbow is why the arm could reach above a tube and then fail to descend.
     ManifoldPlanner::JointVector hint;
     const ManifoldPlanner::JointVector * hint_ptr = nullptr;
     if (goal_hint)
@@ -1789,10 +1400,6 @@ static bool moveFreeSpaceManifold(MGI & mg,
         hint_ptr = &hint;
     }
 
-    // When the caller named the configuration it needs, plan straight to it.
-    // Aiming at the POSE instead leaves the choice of configuration to the
-    // planner, and a different one at the same pose is what stalls the descent
-    // that follows.
     const Eigen::Vector3d tcp(target.position.x, target.position.y, target.position.z);
     const auto res = g_manifold->planToToolPose(start, tcp, &roll, hint_ptr);
 
@@ -1804,8 +1411,6 @@ static bool moveFreeSpaceManifold(MGI & mg,
         return false;
     }
 
-    // Belt and braces. The tilt is zero by construction, so a non-zero reading
-    // means an assumption broke somewhere upstream.
     if (res.max_tilt > hard_limit)
     {
         std::cout << "    [manifold] rejected: tilt " << (res.max_tilt * 180.0 / M_PI)
@@ -1814,9 +1419,7 @@ static bool moveFreeSpaceManifold(MGI & mg,
     }
 
     // ---- time parameterisation -----------------------------------------
-    // The planner returns geometry only. This is the same time-optimal
-    // parameterisation the OMPL pipeline applies through its
-    // AddTimeOptimalParameterization request adapter.
+
     robot_trajectory::RobotTrajectory rt(mg.getRobotModel(), mg.getName());
     moveit::core::RobotState wp(scene->getCurrentState());
 
@@ -1831,31 +1434,11 @@ static bool moveFreeSpaceManifold(MGI & mg,
         wp.update();
     };
 
-    // The path starts at the PROJECTION of the current state onto the upright
-    // manifold, not at the current state itself: the planner packs the start
-    // into (q1..q4, phi) and rebuilds the wrist in closed form, so any part of
-    // the real configuration that is off-manifold is discarded.
-    //
-    // move_group refuses to execute a trajectory whose first point is more than
-    // allowed_start_tolerance (0.01 rad) from the measured state, so an arm that
-    // is even slightly off-manifold gets "Invalid Trajectory: start point
-    // deviates from current robot state" and the caller silently falls back to
-    // the 7-DOF pipeline. That is invisible from here because the manifold plan
-    // itself succeeded -- it is the EXECUTION that is rejected.
-    //
-    // While carrying, the arm is already on the manifold from the previous
-    // upright move and the projection is a no-op, which is why this only
-    // surfaced once empty-gripper transits started using this path from home.
-    //
-    // So: begin at the real configuration and bridge to the planned start,
-    // checking every intermediate state.
     const double bridge = (start - res.path.front()).cwiseAbs().maxCoeff();
     if (bridge > 1e-6)
     {
-        // A big projection means the start was nowhere near upright, and
-        // bridging it would swing the tool through unknown orientations.
-        // Refuse and let the caller's fallback deal with it.
-        constexpr double kMaxBridge = 0.25;   // rad, per joint
+
+        constexpr double kMaxBridge = 0.25;
         if (bridge > kMaxBridge)
         {
             std::cout << "    [manifold] start is " << bridge
@@ -1907,8 +1490,6 @@ static bool moveFreeSpaceManifold(MGI & mg,
               << (res.max_tilt * 180.0 / M_PI) << " deg, max joint step "
               << res.max_joint_step << " rad\n";
 
-    // Headroom of the configuration the PLANNER chose to end at, so a pinned
-    // arrival can be blamed on the plan or on execution rather than guessed at.
     if (!res.path.empty())
         std::cout << "    [manifold] planned endpoint limit headroom: "
                   << g_manifold->limitHeadroom(res.path.back()) << " rad\n";
@@ -1916,23 +1497,13 @@ static bool moveFreeSpaceManifold(MGI & mg,
     return mg.execute(traj_msg) == moveit::core::MoveItErrorCode::SUCCESS;
 }
 
-// ---------------------------------------------------------------------------
 // Transit dispatch.
-//
-// The manifold planner is the primary path; moveFreeSpaceUpright() is the
-// fallback for anything it cannot represent or solve. Set use_manifold to false
-// to force the old behaviour.
-// ---------------------------------------------------------------------------
 static bool g_use_manifold = true;
 static int  g_manifold_ok = 0;
 static int  g_manifold_fallback = 0;
 
-// `free_fallback` allows a final unconstrained attempt when everything else
-// fails. Pass it only when the gripper is EMPTY: with nothing to spill there is
-// no reason to fail a move over orientation, and it guarantees an empty-gripper
-// transit can never become harder than it was before orientation-keeping was
-// switched on. Never pass it while carrying -- there the constraint is the
-// whole point.
+// `free_fallback` allows a final unconstrained attempt when everything else fails
+
 static bool transitUpright(MGI & mg,
                            IkValidator & validator,
                            const geometry_msgs::msg::Pose & target,
@@ -1974,18 +1545,8 @@ static bool transitUpright(MGI & mg,
     return false;
 }
 
-// ---------------------------------------------------------------------------
 // Retry wrapper.
-//
-// Every stage of this pipeline is stochastic: random IK seeds, TRAC-IK's own
-// random restarts, RRTConnect's random tree, and a planning scene that moves
-// with the ArUco markers. When a target succeeds on the second or third manual
-// click, it is not luck -- it means the target is marginally feasible and a
-// different random draw found the way. This just does that automatically.
-//
-// Between attempts the arm has usually moved, so the next attempt seeds its IK
-// from a different configuration. That is most of why retrying works.
-// ---------------------------------------------------------------------------
+
 template <typename F>
 static bool withRetries(const char * what, int attempts, F && fn)
 {
@@ -2008,7 +1569,6 @@ static bool withRetries(const char * what, int attempts, F && fn)
     return false;
 }
 
-// ---------------------------------------------------------------------------
 // Backward-planned approach:
 //   1. find a collision-free IK solution at the GRASP pose
 //   2. seed the standoff IK from it, so both ends share an IK branch and the
@@ -2016,7 +1576,7 @@ static bool withRetries(const char * what, int attempts, F && fn)
 //      part-way down
 //   3. free-space transit to that standoff configuration
 //   4. straight-line descent with the fallback ladder
-// ---------------------------------------------------------------------------
+
 static bool approachTarget(MGI & mg,
                            IkValidator & validator,
                            const geometry_msgs::msg::Pose & target,
@@ -2038,18 +1598,14 @@ static bool approachTarget(MGI & mg,
     std::cout << "    [target] (" << target.position.x << ", " << target.position.y
               << ", " << target.position.z << ")\n";
 
-    Stopwatch sw_stage;   // per-stage timing
-    Stopwatch sw_total;   // command -> arm starts moving
+    Stopwatch sw_stage;   
+    Stopwatch sw_total;   
 
     // ---- Step 1: is the FINAL pose reachable and collision-free? -----------
-    // Failing here is much more useful than failing 90% of the way down.
+
     moveit::core::RobotState grasp_state(*current);
     if (!solveNearestIk(mg, validator, target, *current, grasp_state))
     {
-        // Work out WHICH failure this is by re-running IK with the collision
-        // check switched off. If solutions exist without it, the pose is
-        // reachable and something is in the way; if none exist even then, the
-        // arm simply cannot get its tool there.
         const auto * jmg = current->getJointModelGroup(mg.getName());
         const std::string tip = mg.getEndEffectorLink();
         bool kinematically_reachable = false;
@@ -2074,27 +1630,14 @@ static bool approachTarget(MGI & mg,
     }
 
     // ---- Step 2: find a standoff height that also has IK --------------------
-    // A fixed standoff is brittle. The mixer sits at a high pour height, and
-    // adding a full 12 cm on top of that can push the standoff clean out of the
-    // arm's reach even though the target itself is fine. Walk the height down
-    // until something works, and drop to zero (straight to the target, no
-    // descent) rather than failing outright.
     geometry_msgs::msg::Pose standoff = target;
     moveit::core::RobotState standoff_state(grasp_state);
     double used_standoff = -1.0;
 
     std::cout << "    [timing] grasp IK: " << sw_stage.lap() << " ms\n";
 
-    // A standoff configuration is not merely "IK at the right pose". It has to
-    // be a configuration the DESCENT can start from, and those are not the same
-    // thing -- measured, the arm can sit exactly above the tube, collision-free
-    // and in bounds, with joint5 0.005 rad from its stop, and then be unable to
-    // move down at all because every solution below it is a 2.8 rad wrist flip
-    // away. So candidates are generated, cheaply screened for joint-limit
-    // headroom, and then VERIFIED by dry-running the actual descent from them.
     const auto * arm_jmg = current->getJointModelGroup(mg.getName());
 
-    // Best candidate seen at any height, used only if no height verifies.
     moveit::core::RobotState any_unverified(grasp_state);
     geometry_msgs::msg::Pose any_unverified_pose = target;
     double any_unverified_z = 0.0;
@@ -2105,16 +1648,13 @@ static bool approachTarget(MGI & mg,
         const double sz = standoff_z * scale;
         if (sz < 0.005)
         {
-            used_standoff = 0.0;   // no standoff: go straight to the target
+            used_standoff = 0.0;
             break;
         }
 
         geometry_msgs::msg::Pose cand = target;
         cand.position.z += sz;
 
-        // Gate the expensive ladder on reachability. Six generators failing at
-        // an out-of-reach height cost 3.8 s of pure timeout; one cheap probe
-        // answers the same question in tens of milliseconds.
         {
             Stopwatch sw_reach;
             if (!poseIsReachable(mg, cand, grasp_state, *current))
@@ -2125,16 +1665,6 @@ static bool approachTarget(MGI & mg,
             }
         }
 
-        // Candidate generators, best-understood first. The first two are what
-        // this code has always used; the rest only get tried if those turn out
-        // to be undescendable, so the previously-working path is unchanged when
-        // its candidate is good.
-        //
-        // The mirror-seeded generators are not just more retries. Seeds on the
-        // arm's own wrist branch produce candidates on that branch, so when the
-        // arm is already pinned they all come back pinned however many times
-        // they are re-rolled; the mirror is the only one that reaches the other
-        // family of solutions.
         const moveit::core::RobotState grasp_mirror = mirrorWristSeed(grasp_state, arm_jmg);
         const moveit::core::RobotState current_mirror = mirrorWristSeed(*current, arm_jmg);
 
@@ -2153,9 +1683,6 @@ static bool approachTarget(MGI & mg,
         bool have_unverified = false;
         bool accepted = false;
 
-        // Re-seeding often re-finds a configuration already rejected -- measured,
-        // four of six generators returned the same joint1-pinned solution. The
-        // IK cost is already paid by then, but the dry run need not be.
         std::vector<moveit::core::RobotState> already_tried;
 
         for (const auto & gen : gens)
@@ -2183,9 +1710,6 @@ static bool approachTarget(MGI & mg,
             }
             already_tried.push_back(trial);
 
-            // Cheap screen first: a joint already against its stop cannot be
-            // descended from, and rejecting it here costs microseconds instead
-            // of a full dry run.
             std::string tight_joint = "?";
             const double head = minLimitHeadroom(trial, arm_jmg, &tight_joint);
 
@@ -2199,7 +1723,6 @@ static bool approachTarget(MGI & mg,
                 continue;
             }
 
-            // Expensive check: can the descent actually be planned from here?
             const double f = descentDryRun(mg, validator, trial, target,
                                            free_axis_tolerance);
             const double dry_ms = sw_gen.ms();
@@ -2227,11 +1750,6 @@ static bool approachTarget(MGI & mg,
             break;
         }
 
-        // Nothing at this height can be descended from. Keep the best candidate
-        // seen in case every height fails, but try a LOWER standoff rather than
-        // committing to a configuration already known to stall -- measured, going
-        // ahead with it burned all three approach retries and left the arm parked
-        // at 10%. A shorter descent is a better trade than a failed one.
         if (have_unverified && !have_any_unverified)
         {
             any_unverified = best_unverified;
@@ -2260,14 +1778,8 @@ static bool approachTarget(MGI & mg,
 
     if (used_standoff < 0.005)
     {
-        // Straight to the target -- there is no room above it for a descent.
         std::cout << "    [1/1] No standoff possible; moving directly to the target.\n";
-        // Orientation is kept whether or not a tube is held. Previously the
-        // empty-gripper case skipped the constraint entirely, because
-        // constrained planning cost ~10 s and failed 40% of the time. On the
-        // manifold it costs ~30 ms, so there is no longer a reason to let the
-        // wrist tumble -- measured, an unconstrained transit tilted the tool
-        // 32.5 degrees.
+
         const bool ok = carrying
             ? transitUpright(mg, validator, target, vel_scale, acc_scale,
                              tcp_link, planning_frame)
@@ -2284,26 +1796,8 @@ static bool approachTarget(MGI & mg,
     std::cout << "    [1/2] Transit to standoff (z+" << standoff_z << ")...\n";
 
     // Upright transit regardless of payload. The 5-DOF manifold planner
-    // satisfies the constraint exactly and costs ~30 ms, so the old reasoning
-    // -- that an empty gripper should skip the constraint to avoid a 10 s
-    // constrained plan -- no longer holds. Measured, an unconstrained transit
-    // tilted the tool 32.5 degrees.
-    // Orientation-keeping now applies with an EMPTY gripper too. It was reverted
-    // once because the descent afterwards stalled between 10% and 80%, which
-    // looked like a collision and was not: the transit plans to the standoff
-    // POSE, and the configuration it chose there had joint5 pressed against its
-    // 2.967 rad stop, so the descent's first waypoints could only be reached by
-    // flipping the wrist 2.8 rad to the mirror branch. Two things fix it and
-    // both are needed:
-    //
-    //   * standoff_state above is now selected for descendability, not merely
-    //     for existing -- so the configuration being asked for is a good one;
-    //   * it is passed to the transit as a goal HINT, so the planner aims at
-    //     that configuration instead of any configuration at that pose.
-    //
-    // Arrival is then verified rather than assumed, because the hint is a
-    // preference: if every goal state near it is filtered out the planner falls
-    // back to a pose goal and can still land elsewhere.
+    // satisfies the constraint exactly
+    
     const bool upright_transit = g_upright_when_empty.load() || carrying;
     if (!carrying)
         std::cout << "    [mode] empty gripper, standoff transit = "
@@ -2347,10 +1841,7 @@ static bool approachTarget(MGI & mg,
 
     std::cout << "    [timing] transit (plan + execute): " << sw_stage.lap() << " ms\n";
 
-    // ---- Step 3b: did the arm actually arrive where it was asked to? --------
-    // The descent was verified from standoff_state. If the transit put the arm
-    // somewhere else at the same pose, that verification does not transfer, so
-    // re-check it from where the arm really is and reconfigure if needed.
+    // Step 3b: did the arm actually arrive where it was asked to
     if (auto arrived = mg.getCurrentState(2.0))
     {
         std::string tight_joint = "?";
@@ -2372,14 +1863,6 @@ static bool approachTarget(MGI & mg,
                           << "%. Reconfiguring in place\n        to the verified standoff "
                              "configuration.\n";
 
-                // Same pose, different configuration: a null-space move, and the
-                // two configurations can be a wrist flip apart. Interpolating
-                // straight between them sweeps the wrist through the rack, so
-                // plan it properly and let the planner route around -- naive
-                // interpolation was measured failing here on a collision.
-                //
-                // Nothing holds the tool upright in the middle of a null-space
-                // move either, hence the constraint while carrying.
                 mg.setStartStateToCurrentState();
                 mg.clearPoseTargets();
                 mg.clearPathConstraints();
@@ -2397,7 +1880,6 @@ static bool approachTarget(MGI & mg,
 
                 if (!fixed)
                 {
-                    // Last resort: the direct interpolation, tilt-checked.
                     geometry_msgs::msg::Quaternion ref = standoff.orientation;
                     fixed = moveJointInterpolated(mg, validator, standoff_state,
                                                   vel_scale, acc_scale, 30, 0.006,
@@ -2428,17 +1910,8 @@ static bool approachTarget(MGI & mg,
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Vertical ascent -- the mirror of the descent inside approachTarget().
-//
-// Call this immediately after closing the gripper (so the tube clears the rack
-// before the arm reorients) and again after releasing it (so the fingers clear
-// the tube before any free-space move). Both are the moments where a normal
-// OMPL move would swing the wrist and knock over a neighbour.
-//
-// Uses the same three-rung ladder as the descent, so it degrades gracefully
-// instead of failing outright.
-// ---------------------------------------------------------------------------
+// Vertical ascent
+
 static bool retreatVertical(MGI & mg,
                             IkValidator & validator,
                             double lift_z,
@@ -2459,11 +1932,7 @@ static bool retreatVertical(MGI & mg,
     return true;
 }
 
-
-
-// ============================================================================
 //  MOVEIT TASK CONSTRUCTOR PIPELINE
-// ============================================================================
 
 static bool executeLiquidTransferTask(int target_marker,
                                       tf2_ros::Buffer & tf_buffer,
@@ -2474,12 +1943,8 @@ static bool executeLiquidTransferTask(int target_marker,
     const std::string tube_name = "tube_" + std::to_string(target_marker);
     std::cout << "\n>>> [MTC] Building pipeline for " << tube_name << "...\n";
 
-    // Freeze the background updater for the whole plan+execute cycle. MTC plans
-    // offline against a snapshot; letting the updater rewrite the scene
-    // underneath it produces plans that are invalid before they even run.
     ScenePause pause;
 
-    // ---- 1. TF lookups (fail fast before building anything) ----------------
     double tube_mx = 0.0, tube_my = 0.0, mixer_mx = 0.0, mixer_my = 0.0;
     if (!lookupMarkerXY(tf_buffer, planning_frame, target_marker, tube_mx, tube_my))
     {
@@ -2500,8 +1965,7 @@ static bool executeLiquidTransferTask(int target_marker,
     const geometry_msgs::msg::Quaternion q_upright_msg = tf2::toMsg(q_upright);
 
     // ---- 2. Task and solvers -----------------------------------------------
-    // Static so the Task outlives this function and the RViz "Motion Planning
-    // Tasks" panel can still introspect the solution after execution.
+
     static std::unique_ptr<mtc::Task> task_holder;
     task_holder = std::make_unique<mtc::Task>();
     mtc::Task & task = *task_holder;
@@ -2512,12 +1976,6 @@ static bool executeLiquidTransferTask(int target_marker,
     task.setProperty("group", std::string("arm_group"));
     task.setProperty("ik_frame", tcp_link);
 
-    // Your MTC version exposes only PipelinePlanner(node, pipeline_name). The
-    // three-argument constructor that also takes a planner id was added later,
-    // so the id goes in as a property instead.
-    //
-    // If setPlannerId() is missing on your version too, replace that line with:
-    //     planner_ompl->setProperty("planner", std::string("RRTConnectkConfigDefault"));
     auto planner_ompl = std::make_shared<mtc::solvers::PipelinePlanner>(node, "ompl");
     planner_ompl->setPlannerId("RRTConnectkConfigDefault");
     planner_ompl->setMaxVelocityScalingFactor(VEL_SCALE_TRANSIT);
@@ -2528,12 +1986,8 @@ static bool executeLiquidTransferTask(int target_marker,
     planner_cartesian->setMaxVelocityScalingFactor(VEL_SCALE_LIQUID);
     planner_cartesian->setMaxAccelerationScalingFactor(ACC_SCALE_LIQUID);
     planner_cartesian->setStepSize(0.005);
-    // If your MTC version has deprecated setJumpThreshold, drop this line --
-    // but do not set it to 0 on a redundant arm.
     planner_cartesian->setJumpThreshold(5.0);
 
-    // Gripper open/close needs no obstacle avoidance; straight joint
-    // interpolation is faster and cannot fail for spurious planner reasons.
     auto planner_gripper = std::make_shared<mtc::solvers::JointInterpolationPlanner>();
 
     const auto * gripper_jmg = task.getRobotModel()->getJointModelGroup("gripper");
@@ -2555,7 +2009,7 @@ static bool executeLiquidTransferTask(int target_marker,
         task.add(std::move(s));
     }
 
-    // Pre-grasp: directly above the tube.
+    // Pre-grasp: above the tube.
     geometry_msgs::msg::PoseStamped pregrasp;
     pregrasp.header.frame_id  = planning_frame;
     pregrasp.pose.position.x  = grasp_x;
@@ -2569,19 +2023,13 @@ static bool executeLiquidTransferTask(int target_marker,
         task.add(std::move(s));
     }
 
-    // CRITICAL: the fingers are about to descend around a collision cylinder.
-    // attachObject() alone does NOT create these ACM entries -- without this
-    // stage the Cartesian approach returns a partial fraction and the task
-    // fails at the first descent.
     {
         auto s = std::make_unique<mtc::stages::ModifyPlanningScene>("allow gripper-tube contact");
         s->allowCollisions(tube_name, gripper_links, true);
         task.add(std::move(s));
     }
 
-    // Descend a deterministic distance. A loose min/max bracket lets MoveRelative
-    // take the full max whenever nothing blocks, which silently shifts the grasp
-    // height by centimetres.
+    // Descend a deterministic distance
     {
         auto s = std::make_unique<mtc::stages::MoveRelative>("approach tube", planner_cartesian);
         s->setGroup("arm_group");
@@ -2594,8 +2042,7 @@ static bool executeLiquidTransferTask(int target_marker,
         task.add(std::move(s));
     }
 
-    // Attach before closing, so the ACM is already correct while the fingers
-    // move into the tube geometry.
+    // Attach before closing
     {
         auto s = std::make_unique<mtc::stages::ModifyPlanningScene>("attach tube");
         s->attachObject(tube_name, tcp_link);
@@ -2608,7 +2055,7 @@ static bool executeLiquidTransferTask(int target_marker,
         task.add(std::move(s));
     }
 
-    // Straight vertical lift clears the rack before the arm reorients.
+    // Straight vertical lift
     {
         auto s = std::make_unique<mtc::stages::MoveRelative>("lift tube", planner_cartesian);
         s->setGroup("arm_group");
@@ -2621,7 +2068,7 @@ static bool executeLiquidTransferTask(int target_marker,
         task.add(std::move(s));
     }
 
-    // Transit to the mixer, tube held upright.
+    // Transit to the mixer held upright.
     geometry_msgs::msg::PoseStamped pour_pose;
     pour_pose.header.frame_id  = planning_frame;
     mixerPourPose(mixer_mx, mixer_my,
@@ -2633,10 +2080,6 @@ static bool executeLiquidTransferTask(int target_marker,
         auto s = std::make_unique<mtc::stages::MoveTo>("move to mixer", planner_ompl);
         s->setGroup("arm_group");
         s->setGoal(pour_pose);
-
-        // Same convention as the manual path: Z free (roll about the tube),
-        // X and Y tight (tipping). Kept in one helper so the two code paths
-        // cannot drift apart again.
         s->setPathConstraints(
             uprightConstraint(tcp_link, planning_frame, q_upright_msg));
 
@@ -2678,9 +2121,7 @@ static bool executeLiquidTransferTask(int target_marker,
     return true;
 }
 
-// ============================================================================
 //  MAIN
-// ============================================================================
 
 int main(int argc, char * argv[])
 {
@@ -2694,19 +2135,16 @@ int main(int argc, char * argv[])
     MGI arm_interface(node, "arm_group");
     MGI gripper_interface(node, "gripper");
 
-    // Collision-aware IK. Must exist before any motion helper is called.
     IkValidator ik_validator(node);
 
     const std::string planning_frame = arm_interface.getPlanningFrame();
     const std::string tcp_link       = arm_interface.getEndEffectorLink();
 
-    int allowed_tube_id = -1;   // which tube currently has a contact allowance
+    int allowed_tube_id = -1;  
     std::vector<std::string> gripper_links;
     if (const auto * gjmg = arm_interface.getRobotModel()->getJointModelGroup("gripper"))
     {
         gripper_links = gjmg->getLinkModelNames();
-        // The TCP link is often outside the gripper group but is exactly the
-        // link that ends up inside the tube, so add it explicitly.
         if (std::find(gripper_links.begin(), gripper_links.end(), tcp_link) == gripper_links.end())
             gripper_links.push_back(tcp_link);
     }
@@ -2728,9 +2166,7 @@ int main(int argc, char * argv[])
     tf2::Quaternion q_upright;
     q_upright.setRPY(0.0, -M_PI / 2.0, M_PI / 2.0);
 
-    // ---- Reduced-space transit planner --------------------------------------
-    // Primary path for constrained transits; the constrained 7-DOF pipeline
-    // below stays as the fallback. Set use_manifold:=false to disable.
+    // Reduced-space transit planner
     g_use_manifold = node->declare_parameter<bool>("use_manifold", true);
     if (g_use_manifold)
     {
@@ -2749,8 +2185,6 @@ int main(int argc, char * argv[])
         }
         catch (const std::exception & e)
         {
-            // A bad model or a changed URDF convention must not take the task
-            // down -- the old pipeline still works.
             std::cout << "[!] [INIT] Manifold planner unavailable (" << e.what()
                       << "); using constrained 7-DOF planning only.\n";
             g_manifold.reset();
@@ -2766,8 +2200,6 @@ int main(int argc, char * argv[])
     arm_interface.setPlanningTime(10.0);
     arm_interface.setNumPlanningAttempts(5);
     arm_interface.setWorkspace(-1.0, -1.0, -0.1, 1.0, 1.0, 1.0);
-    // Tight tolerances throughout. The original 0.12 m position tolerance made
-    // the goal a 12 cm blob, which is a large region for OMPL to sample from.
     arm_interface.setGoalPositionTolerance(0.005);
     arm_interface.setGoalOrientationTolerance(0.02);
 
@@ -2802,9 +2234,6 @@ int main(int argc, char * argv[])
                       << " (pending: " << command_queue.size() << ")\n";
         });
 
-    // Outcome channel. A sequencing client publishes one command, waits for the
-    // matching OK/FAIL here, and only then sends the next -- which is what stops
-    // a batch continuing after a failed grasp.
     auto status_pub = node->create_publisher<std_msgs::msg::String>("/gui_status", 10);
 
     std::string attached_tube;
@@ -2839,9 +2268,8 @@ int main(int argc, char * argv[])
 
     std::cout << "\n>>> Ready. Listening on /gui_commands.\n";
 
-    // ========================================================================
     //  MAIN EXECUTION LOOP
-    // ========================================================================
+    
     while (rclcpp::ok())
     {
         std::string line;
@@ -2862,18 +2290,12 @@ int main(int argc, char * argv[])
 
         std::cout << "\n[EXECUTING] " << line << "\n";
 
-        // Publishes OK/FAIL for this command when it goes out of scope, on
-        // every path including the early `continue`s below.
         CommandReport report{ status_pub, line, false };
 
         // ---- Quit -----------------------------------------------------------
         if (line == "q" || line == "Q") { report.ok = true; break; }
 
         // ---- MTC pipeline ---------------------------------------------------
-        // This check MUST come before the coordinate parsing below. In the
-        // previous version it sat after the "m<N>" / "x y z" block, so "TASK 3"
-        // fell into the coordinate parser, failed to read three doubles, and
-        // hit `continue` -- the MTC branch was unreachable dead code.
         if (line.rfind("TASK", 0) == 0 || line.rfind("task", 0) == 0)
         {
             int marker_id = -1;
@@ -2905,9 +2327,6 @@ int main(int argc, char * argv[])
 
             if (ok)
             {
-                // Keep the MoveGroupInterface-side bookkeeping in sync, or the
-                // 'o' command will not know there is anything to detach and the
-                // updater will republish a world copy of the held tube.
                 attached_tube     = "tube_" + std::to_string(marker_id);
                 current_marker_id = marker_id;
                 attached_marker_id.store(marker_id);
@@ -2921,7 +2340,6 @@ int main(int argc, char * argv[])
             continue;
         }
 
-        // ---- Toggle upright transit with an empty gripper --------------------
         if (line == "u" || line == "U")
         {
             const bool now = !g_upright_when_empty.load();
@@ -2935,7 +2353,6 @@ int main(int argc, char * argv[])
             continue;
         }
 
-        // ---- Home -----------------------------------------------------------
         if (line == "h" || line == "H")
         {
             const double v = attached_tube.empty() ? VEL_SCALE_TRANSIT : VEL_SCALE_LIQUID;
@@ -2954,7 +2371,7 @@ int main(int argc, char * argv[])
             continue;
         }
 
-        // ---- Open gripper ---------------------------------------------------
+        // Open gripper
         if (line == "o" || line == "O")
         {
             std::cout << ">>> Opening gripper...\n";
@@ -2963,24 +2380,20 @@ int main(int argc, char * argv[])
             {
                 if (!attached_tube.empty())
                 {
-                    // detachObject() returns the object to the world at its
-                    // current attached pose. The updater will then snap it back
-                    // to wherever its marker is.
+                    // detachObject() returns the object to the world
                     const int released_id = attached_marker_id.load();
                     arm_interface.detachObject(attached_tube);
                     std::cout << ">>> Detached " << attached_tube << ".\n";
                     attached_tube.clear();
                     rclcpp::sleep_for(std::chrono::milliseconds(200));
 
-                    // Vertical ascent before anything else, so the fingers clear
-                    // the tube instead of dragging it out of the rack.
+                    // Vertical ascent
                     waitForStateSettle(arm_interface, 200);
                     if (!retreatVertical(arm_interface, ik_validator, LIFT_DIST,
                                          VEL_SCALE_TRANSIT, ACC_SCALE_TRANSIT,
                                          TOOL_AXIS_FREEDOM))
                         std::cout << "    [!] Could not lift clear of the tube.\n";
 
-                    // Revoke the contact allowance and let the updater track it again.
                     if (!gripper_links.empty() && released_id >= 1)
                         ik_validator.allowCollisions("tube_" + std::to_string(released_id),
                                                      gripper_links, false);
@@ -2997,7 +2410,7 @@ int main(int argc, char * argv[])
             continue;
         }
 
-        // ---- Close gripper (manual grasp) -----------------------------------
+        // Close gripper (manual grasp)
         if (line == "c" || line == "C")
         {
             std::cout << ">>> Closing gripper...\n";
@@ -3006,8 +2419,6 @@ int main(int argc, char * argv[])
             {
                 const std::string tube_id = "tube_" + std::to_string(current_marker_id);
 
-                // Re-place the tube at the TCP before attaching, so the attached
-                // geometry matches where the tube physically is.
                 const auto eef = arm_interface.getCurrentPose().pose;
                 moveit_msgs::msg::CollisionObject restored;
                 restored.id = tube_id;
@@ -3016,10 +2427,6 @@ int main(int argc, char * argv[])
                 restored.primitives[0].type = shape_msgs::msg::SolidPrimitive::CYLINDER;
                 restored.primitives[0].dimensions = { TUBE_HEIGHT, TUBE_RADIUS };
                 restored.primitive_poses.resize(1);
-                // The tube sits between the FINGERS, which are 135 mm beyond the
-                // flange that getEndEffectorLink() reports. Offsetting by zero
-                // here parks the cylinder at the wrist instead -- visible in
-                // RViz as a tube floating through the forearm.
                 restored.primitive_poses[0].position.x = eef.position.x;
                 restored.primitive_poses[0].position.y = eef.position.y + TUBE_TCP_Y_OFFSET;
                 restored.primitive_poses[0].position.z = eef.position.z + TUBE_TCP_Z_OFFSET;
@@ -3037,8 +2444,6 @@ int main(int argc, char * argv[])
                 arm_interface.attachObject(tube_id, tcp_link, touch_links);
                 attached_tube = tube_id;
                 std::cout << ">>> Attached " << tube_id << " to " << tcp_link << ".\n";
-
-                // Let the planning scene publish the new ACM before moving.
                 rclcpp::sleep_for(std::chrono::milliseconds(200));
             }
 
@@ -3046,12 +2451,6 @@ int main(int argc, char * argv[])
             if (gripper_interface.move() == moveit::core::MoveItErrorCode::SUCCESS)
             {
                 std::cout << ">>> Gripper closed.\n";
-
-                // Vertical ascent: clear the rack before the arm is allowed to
-                // reorient. Skipping this is how neighbouring tubes get knocked
-                // over -- the first thing a free-space move does is swing the
-                // wrist, and at this moment the tube is still between its
-                // neighbours.
                 if (!attached_tube.empty())
                 {
                     waitForStateSettle(arm_interface, 200);
@@ -3078,7 +2477,7 @@ int main(int argc, char * argv[])
             continue;
         }
 
-        // ---- Pour -----------------------------------------------------------
+        // Pour
         if (line == "p" || line == "P")
         {
             if (attached_tube.empty())
@@ -3133,7 +2532,7 @@ int main(int argc, char * argv[])
             continue;
         }
 
-        // ---- Manual move: "m<N>" or raw "x y z" ------------------------------
+        // Manual move: "m<N>" or raw "x y z"
         double tx = 0.0, ty = 0.0, tz = 0.0;
         double standoff = STANDOFF_TUBE;
 
@@ -3200,10 +2599,10 @@ int main(int argc, char * argv[])
                 std::cout << "    [-] Unrecognised command.\n";
                 continue;
             }
-            current_marker_id = -1;   // a raw coordinate is not a tube
+            current_marker_id = -1;
         }
 
-        // ---- Execute the manual hybrid move ----------------------------------
+        // Execute the manual hybrid move
         std::cout << "--- Moving to (" << tx << ", " << ty << ", " << tz << ") ---\n";
 
         geometry_msgs::msg::Pose target;
@@ -3220,9 +2619,7 @@ int main(int argc, char * argv[])
 
         const bool carrying = !attached_tube.empty();
 
-        // The tube cylinder sits exactly where the gripper is going, so the
-        // fingers must be allowed to touch this one tube or every grasp pose
-        // reads as a collision. Granted before the approach, revoked on release.
+
         if (!carrying && current_marker_id >= 1 && current_marker_id <= NUM_TUBES &&
             !gripper_links.empty() && allowed_tube_id != current_marker_id)
         {
@@ -3235,11 +2632,6 @@ int main(int argc, char * argv[])
             allowed_tube_id = current_marker_id;
         }
 
-        // Retries are not superstition: every stage here is stochastic (random
-        // IK seeds, TRAC-IK's own restarts, RRTConnect's tree, a scene that
-        // moves with the markers). A target that needs two or three tries is
-        // marginally feasible rather than wrong, and each attempt re-seeds from
-        // a different arm configuration.
         const bool reached = withRetries("approach", 3, [&]() {
             return approachTarget(arm_interface, ik_validator, target, standoff,
                                   v, a, TOOL_AXIS_FREEDOM,
@@ -3249,9 +2641,6 @@ int main(int argc, char * argv[])
         if (!reached)
         {
             std::cout << "    [!] RECOVERY: returning home...\n";
-            // Recovery used to drop the constraint entirely, which meant the
-            // arm was free to tip a full tube on the way back. Keep it upright,
-            // just with a looser tolerance so recovery itself can succeed.
             const bool home_ok = carrying
                 ? transitUpright(arm_interface, ik_validator, home_pose,
                                  VEL_SCALE_LIQUID, ACC_SCALE_LIQUID,
@@ -3269,7 +2658,7 @@ int main(int argc, char * argv[])
 
         arm_interface.clearPathConstraints();
         waitForStateSettle(arm_interface);
-    }   // end while
+    }
 
     std::cout << "\n>>> Shutting down.\n";
     rclcpp::shutdown();
